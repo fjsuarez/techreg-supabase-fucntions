@@ -7,29 +7,30 @@ const corsHeaders = {
   'Access-Control-Allow-Methods': 'POST, GET, OPTIONS, PUT, DELETE',
 }
 
+// We'll make this interface dynamic, based on the categories in the database
 interface ProcessingResult {
-  sovereignty_security: 'low' | 'medium' | 'high'
-  precautionary: 'low' | 'medium' | 'high'
-  innovation_first: 'low' | 'medium' | 'high'
-  rights_justice: 'low' | 'medium' | 'high'
-  utilitarian: 'low' | 'medium' | 'high'
-  decentralized: 'low' | 'medium' | 'high'
   protectionist: -1 | 0 | 1
   progressive: -1 | 0 | 1
+  // Other categories will be added dynamically
+  [key: string]: 'low' | 'medium' | 'high' | -1 | 0 | 1 | number
 }
 
-async function processWithLLM(qaText: string): Promise<{ summary: string; scores: ProcessingResult }> {
+async function processWithLLM(
+  qaText: string, 
+  categories: string[],
+  numericalScores: Record<string, number>
+): Promise<{ summary: string; scores: ProcessingResult }> {
+  // Format the categories as a readable list for the prompt
+  const categoriesList = categories.map(cat => 
+    cat.split('_').map(word => word.charAt(0).toUpperCase() + word.slice(1)).join('-')
+  ).join('\n');
+  
   const prompt = `Based on this set of answers and responses below, create a 
 Summary report of the regulatory mindset of the respondent to the questions.
 It should estimate a value of low, medium, and high for each of the following tech
 regulation mindset characteristics:
 
-Sovereignty-Security-Oriented 
-Precautionary
-Innovation-First
-Rights and Justice-Oriented
-Utilitarian
-Decentralized
+${categoriesList}
 
 In the summary section, provide a rating of  '-1: Negative', '0: Neutral', '+1: Positive' for  
 the respondent's mindset on being 'Protectionist' and a rating of '-1: Negative', '0: Neutral', '+1 Positive' for 'Progressive'.
@@ -38,17 +39,19 @@ The report should be written in a helpful tone directly to the respondent,
 but don't start with a name. Begin with 'Thank you for taking the time 
 to provide your insights on technology regulation.'
 
-Additionally, provide a JSON object at the end of your response, enclosed in a Markdown code block (\`\`\`json...\`\`\`). This JSON object should contain the following keys and their corresponding values (low, medium, high, or -1, 0, 1):
-{
-    "sovereignty_security": "low|medium|high",
-    "precautionary": "low|medium|high",
-    "innovation_first": "low|medium|high",
-    "rights_justice": "low|medium|high",
-    "utilitarian": "low|medium|high",
-    "decentralized": "low|medium|high",
-    "protectionist": -1|0|1,
-    "progressive": -1|0|1
-}
+Additionally, provide a JSON object at the end of your response, enclosed in a Markdown code block (\`\`\`json...\`\`\`). This JSON object should contain the following keys:
+
+1. All category keys with their corresponding values (low, medium, high):
+${categories.map(cat => `"${cat}": "low|medium|high"`).join(',\n')}
+
+2. The two special assessment keys:
+"protectionist": -1|0|1,
+"progressive": -1|0|1
+
+The JSON should also include the numerical scores I've calculated, under the same keys but with "_score" appended:
+${Object.entries(numericalScores).map(([cat, score]) => 
+  `"${cat}_score": ${score.toFixed(2)}`
+).join(',\n')}
 
 These are the questions and answers:
 
@@ -81,7 +84,55 @@ ${qaText}`
   const scores = JSON.parse(jsonMatch[1])
   const summary = content.replace(/```json[\s\S]*?```/, '').trim()
 
+  // Merge numerical scores into the results
+  Object.entries(numericalScores).forEach(([category, score]) => {
+    scores[`${category}_score`] = score
+  })
+
   return { summary, scores }
+}
+
+// Function to calculate numerical scores per category
+function calculateCategoryScores(
+  questions: any[], 
+  responses: Record<string, { rating: number, explanation?: string }>
+): Record<string, number> {
+  // Group questions by category
+  const categoriesMap: Record<string, { score: number, count: number, totalWeight: number }> = {}
+  
+  questions.forEach(question => {
+    const response = responses[question.id.toString()]
+    if (!response || response.rating === undefined) return
+    
+    const category = question.category.toLowerCase().replace(/\s+/g, '_')
+    const rating = response.rating
+    const weight = question.weight || 1 // Default weight to 1
+    const isForward = question.forward === 1 || question.forward === true
+
+    // Adjust rating if not forward (reverse the scale)
+    const adjustedRating = isForward ? rating : (6 - rating)
+    const weightedRating = adjustedRating * weight
+    
+    if (!categoriesMap[category]) {
+      categoriesMap[category] = { score: 0, count: 0, totalWeight: 0 }
+    }
+    
+    categoriesMap[category].score += weightedRating
+    categoriesMap[category].count += 1
+    categoriesMap[category].totalWeight += weight
+  })
+  
+  // Calculate average scores per category
+  const categoryScores: Record<string, number> = {}
+  Object.entries(categoriesMap).forEach(([category, data]) => {
+    if (data.totalWeight > 0) {
+      categoryScores[category] = data.score / data.totalWeight
+    } else {
+      categoryScores[category] = 0
+    }
+  })
+  
+  return categoryScores
 }
 
 Deno.serve(async (req) => {
@@ -113,6 +164,13 @@ Deno.serve(async (req) => {
     if (questionsError) {
       throw new Error(`Failed to fetch questions: ${questionsError.message}`)
     }
+
+    // Extract unique categories from questions
+    const uniqueCategories = Array.from(
+      new Set(questions?.map(q => q.category?.toLowerCase().replace(/\s+/g, '_')).filter(Boolean))
+    ) as string[]
+
+    console.log(`Found ${uniqueCategories.length} unique categories: ${uniqueCategories.join(', ')}`)
 
     const results = []
     const maxMessages = 5 // Process up to 5 messages per run
@@ -172,25 +230,26 @@ Deno.serve(async (req) => {
           throw new Error(`Failed to update status: ${updateStatusError.message}`)
         }
 
+        // Calculate numerical scores for each category
+        const numericalScores = calculateCategoryScores(questions || [], responses)
+
         // Format Q&A text for LLM using the questions fetched once
         let qaText = ''
         questions?.forEach(question => {
           const response = responses[question.id.toString()]
           if (response) {
-            qaText += `Q: ${question.question_text}
-`
-            qaText += `Rating: ${response.rating}/5
-`
+            qaText += `Q: ${question.question_text}\n`
+            qaText += `Category: ${question.category}\n`
+            qaText += `Rating: ${response.rating}/5\n`
             if (response.explanation) {
-              qaText += `Explanation: ${response.explanation}
-`
+              qaText += `Explanation: ${response.explanation}\n`
             }
             qaText += '\n'
           }
         })
 
-        // Process with LLM
-        const { summary, scores } = await processWithLLM(qaText)
+        // Process with LLM, passing categories and numerical scores
+        const { summary, scores } = await processWithLLM(qaText, uniqueCategories, numericalScores)
 
         // Update submission with results
         const { error: updateError } = await supabaseClient
