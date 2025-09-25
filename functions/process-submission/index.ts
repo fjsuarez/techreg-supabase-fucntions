@@ -107,7 +107,7 @@ function calculateCategoryScores(
     const category = question.category.toLowerCase().replace(/\s+/g, '_')
     const rating = response.rating
     const weight = question.weight || 1 // Default weight to 1
-    const isForward = question.forward === 1 || question.forward === true
+    const isForward = Number(question.forward) > 0;
 
     // Adjust rating if not forward (reverse the scale)
     const adjustedRating = isForward ? rating : (6 - rating)
